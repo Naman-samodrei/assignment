@@ -57,6 +57,31 @@ class CheckOut(models.Model):
 
     class Meta:
         ordering = ["-checked_out_at"]
+        constraints = [
+            # Rule 7. The database — not the application — is what guarantees a
+            # single open check-out per asset. Two concurrent requests that both
+            # get past the status read still leave exactly one row here; the
+            # loser raises IntegrityError, which the service turns into a 409.
+            models.UniqueConstraint(
+                fields=["asset"],
+                condition=Q(returned_at__isnull=True),
+                name="uniq_open_checkout_per_asset",
+            ),
+        ]
+        indexes = [
+            # Rule 3 counts an employee's open check-outs on every request.
+            models.Index(
+                fields=["employee", "returned_at"], name="checkout_emp_open_idx"
+            ),
+            # Overdue lookups scan open rows by due date.
+            models.Index(
+                fields=["returned_at", "due_at"], name="checkout_open_due_idx"
+            ),
+        ]
+
+    @property
+    def is_open(self) -> bool:
+        return self.returned_at is None
 
     def __str__(self) -> str:
         return f"{self.asset_id} -> {self.employee_id}"

@@ -37,6 +37,13 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+
+    # third party
+    'rest_framework',
+    'django_filters',
+
+    # local
+    'fieldassets',
 ]
 
 MIDDLEWARE = [
@@ -76,6 +83,18 @@ DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
         'NAME': BASE_DIR / 'db.sqlite3',
+        'OPTIONS': {
+            # Rule 7 needs real write serialisation. WAL plus IMMEDIATE means a
+            # transaction takes SQLite's single write lock at BEGIN rather than
+            # at its first write, so a concurrent check-out waits for the lock
+            # (up to `timeout`) instead of failing with "database is locked"
+            # halfway through. On PostgreSQL these options are unnecessary --
+            # the SELECT ... FOR UPDATE in the service does the same job at row
+            # granularity.
+            'init_command': 'PRAGMA journal_mode=WAL;',
+            'transaction_mode': 'IMMEDIATE',
+            'timeout': 20,
+        },
     }
 }
 
@@ -120,3 +139,26 @@ STATIC_URL = 'static/'
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+
+# Django REST Framework
+# https://www.django-rest-framework.org/api-guide/settings/
+
+REST_FRAMEWORK = {
+    'DEFAULT_FILTER_BACKENDS': [
+        'django_filters.rest_framework.DjangoFilterBackend',
+    ],
+    'DEFAULT_RENDERER_CLASSES': [
+        'rest_framework.renderers.JSONRenderer',
+        'rest_framework.renderers.BrowsableAPIRenderer',
+    ],
+    'EXCEPTION_HANDLER': 'fieldassets.exceptions.api_exception_handler',
+    'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
+    'PAGE_SIZE': 20,
+}
+
+
+# Business rules (A2).
+
+MAX_OPEN_CHECKOUTS_PER_EMPLOYEE = 3
+MAX_DUE_AT_HORIZON_DAYS = 30
