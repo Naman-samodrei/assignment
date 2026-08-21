@@ -24,7 +24,7 @@ Access tokens last 60 minutes; `POST /api/v1/auth/token/refresh/` with
 
 ```bash
 docker compose up -d --build          # WEB_PORT=8090 docker compose up -d  if 8000 is taken
-docker compose exec web python manage.py createsuperuser
+docker compose exec web python manage.py seed_demo_data
 docker compose logs -f worker beat
 ```
 
@@ -39,7 +39,7 @@ network — so the stack cannot collide with a Redis you already run.
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 python manage.py migrate
-python manage.py createsuperuser     # the account you get a token for
+python manage.py seed_demo_data      # data + the account you get a token for
 python manage.py runserver
 ```
 
@@ -210,6 +210,54 @@ CELERY_BEAT_SCHEDULE = {
 Verified end to end by temporarily running a throwaway `beat` container with a
 5-second schedule: Beat logged five `Sending due task` lines, the worker logged
 five completions, and the notice count stayed at 5 with zero duplicates.
+
+## A6 — seed data
+
+```bash
+python manage.py seed_demo_data
+# or: docker compose exec web python manage.py seed_demo_data
+```
+
+One command, and the API is ready to exercise — including the account you
+authenticate with, since every endpoint but `/health/` needs a JWT. It prints
+the credentials and the `curl` that turns them into a token.
+
+| | Seeded | Brief asks for |
+|---|---|---|
+| assets | 10, across all four categories | at least 8, all four |
+| employees | 5, one inactive | at least 4, one inactive |
+| currently overdue | 2 | at least 2 |
+| returned on time | 2 | at least 2 |
+| returned late | 1 | at least 1 |
+
+Statuses are **derived** from the check-outs rather than written by hand, so the
+seed cannot produce the state rule 5 forbids — an open check-out sitting next to
+an `AVAILABLE` asset. Two tests assert that in both directions.
+
+The data is arranged so every rule can be walked without setting anything up:
+
+| Try | Expect | Rule |
+|---|---|---|
+| `asset_tag: CAM-001` (held) | `409` | 1 |
+| `asset_tag: SEN-003` (maintenance) | `409` | 1 |
+| `employee_code: EMP004` (inactive) | `400` | 2 |
+| `employee_code: EMP001` (already holds three) | `409` | 3 |
+| `asset_tag: NOPE-999` | `404` | 8 |
+| `asset_tag: SEN-002`, `employee_code: EMP005` | `201` | happy path |
+
+`EMP003` has the three returned check-outs, so
+`/employees/EMP003/summary/` returns a real `mean_hold_days` (13.67) rather than
+a zero, and `/reports/overdue/` returns `EMP002`'s two.
+
+### Re-runnable
+
+Assets and employees are matched on their business keys and updated in place.
+The seeded check-outs are rebuilt each run — a check-out has no natural key, and
+the rule 7 partial unique index would rightly reject a second open row for an
+asset that already has one. Only rows belonging to seeded employees are cleared,
+so anything you created yourself is left alone.
+
+Verified by running it four times and diffing the full state — asset statuses,
 
 ## A5 — tests
 
