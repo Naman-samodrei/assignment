@@ -350,6 +350,9 @@ summary would not have moved with the report. `queries.open_and_overdue()` now
 takes a `prefix` so the summary applies literally the same predicate across the
 relation; the mutation now fails all three consumers instead of two.
 
+### Recorded screen url : 
+[ulr] (https://drive.google.com/file/d/1oRhrpXOUKMgGiHPdNcgLWfvttkky0RbN/view?usp=sharing)
+
 ## Assumptions
 
 Judgement calls where the brief left room:
