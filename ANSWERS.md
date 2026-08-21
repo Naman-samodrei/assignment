@@ -1179,3 +1179,83 @@ they have different ceilings. If it is I/O, the 142× reduction in blocks read i
 the number that predicts the improvement. If it is CPU, the win comes from the
 4.18M discarded rows disappearing, and I should expect less than the block ratio
 suggests. I would rather know which before promising anyone a number.
+
+---
+
+# Part D — Production reasoning
+
+## D1. Zero-downtime migration: adding a non-nullable `location_id`
+
+**Four deploys and a backfill job.** The rule throughout is that old and new code
+run simultaneously during every rolling deploy, so each schema state must be
+valid for both.
+
+**Deploy 1 — schema only, no code change.** Add the column nullable, add the FK
+unvalidated, index concurrently:
+
+```sql
+ALTER TABLE checkouts ADD COLUMN location_id bigint NULL;
+ALTER TABLE checkouts ADD CONSTRAINT checkouts_location_fk
+      FOREIGN KEY (location_id) REFERENCES locations(id) NOT VALID;
+CREATE INDEX CONCURRENTLY checkouts_location_id_idx ON checkouts (location_id);
+```
+
+In Django this is `SeparateDatabaseAndState` with `RunSQL` and `atomic = False`
+— `CREATE INDEX CONCURRENTLY` cannot run inside a transaction.
+
+**Deploy 2 — code writes the column** on every insert and update, while still
+tolerating `NULL` on read. Must be fully rolled out across all four instances
+before anything depends on it.
+
+**Backfill — a batched job, not a deploy.** A few thousand rows per transaction,
+committing between batches, throttled. One 4.2M-row `UPDATE` would hold row
+locks for its whole duration and bloat the table with dead tuples faster than
+autovacuum reclaims them.
+
+**Deploy 3 — constrain**, once the backfill reports zero remaining NULLs:
+
+```sql
+ALTER TABLE checkouts VALIDATE CONSTRAINT checkouts_location_fk;
+ALTER TABLE checkouts ADD CONSTRAINT loc_not_null
+      CHECK (location_id IS NOT NULL) NOT VALID;
+ALTER TABLE checkouts VALIDATE CONSTRAINT loc_not_null;
+ALTER TABLE checkouts ALTER COLUMN location_id SET NOT NULL;
+ALTER TABLE checkouts DROP CONSTRAINT loc_not_null;
+```
+
+The `CHECK`-then-`SET NOT NULL` dance matters: from PostgreSQL 12, `SET NOT NULL`
+recognises an already-validated `CHECK` and skips its own full scan, so it holds
+`ACCESS EXCLUSIVE` for milliseconds instead of minutes.
+
+**Deploy 4 — model state**, flipping `null=False` on the field with no SQL.
+
+**In-flight requests.** Old code selects its known columns explicitly, so an
+unknown column is invisible to it — Django never issues `SELECT *`, which is why
+this is safe. Old code's inserts omit `location_id` and write `NULL`, which is
+legal until deploy 3. That is the whole reason `NOT NULL` waits: apply it while
+any old instance is still serving and those instances start returning 500s on
+every check-out. Rollback is safe at every step, because the column stays
+nullable until the last one.
+
+**The thing that locks the table.** Naïvely, `ALTER TABLE checkouts ADD COLUMN
+location_id bigint NOT NULL REFERENCES locations(id)` — one statement that
+rewrites 4.2M rows and validates the FK while holding `ACCESS EXCLUSIVE`. That is
+what Django's default `AddField` generates.
+
+But the sharper trap is the one that bites even on the "safe" statements.
+I confirmed the lock modes:
+
+```
+ADD COLUMN nullable    -> AccessExclusiveLock       (instant, metadata only)
+ADD FK ... NOT VALID   -> ShareRowExclusiveLock     (no scan)
+VALIDATE CONSTRAINT    -> ShareUpdateExclusiveLock  (does not block reads/writes)
+SET NOT NULL           -> AccessExclusiveLock
+```
+
+`ADD COLUMN` still takes `ACCESS EXCLUSIVE` — it is safe only because it is
+*fast*. If one long-running `SELECT` holds `ACCESS SHARE`, the `ALTER` waits,
+and **every query arriving afterwards queues behind the pending exclusive
+request**. A migration that needs a millisecond of lock takes the site down for
+as long as that one report runs. So every DDL statement runs with
+`SET lock_timeout = '3s'`, failing fast and retrying rather than forming a
+queue — and I would check `pg_stat_activity` for long transactions first.
