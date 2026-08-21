@@ -20,18 +20,52 @@ Access tokens last 60 minutes; `POST /api/v1/auth/token/refresh/` with
 
 ## Run it
 
-### Docker (brings up Redis, the worker and Beat too)
+### Docker — the command sequence
 
 ```bash
-docker compose up -d --build          # WEB_PORT=8090 docker compose up -d  if 8000 is taken
+docker compose up -d --build
+docker compose exec web python manage.py migrate
 docker compose exec web python manage.py seed_demo_data
-docker compose logs -f worker beat
 ```
 
-Four services: `web`, `redis`, `worker` (Celery), `beat` (Celery Beat). `web`
-runs `migrate` itself before serving. Redis is deliberately **not** published to
-the host — only the app containers talk to it, at `redis:6379` on the compose
-network — so the stack cannot collide with a Redis you already run.
+That is the whole setup. The third command prints the credentials you
+authenticate with. Verify:
+
+```bash
+curl -s localhost:8000/api/v1/health/
+# {"status":"ok","database":"ok"}
+
+TOK=$(curl -s -X POST localhost:8000/api/v1/auth/token/ \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"demo","password":"demo12345"}' | python3 -c "import sys,json;print(json.load(sys.stdin)['access'])")
+
+curl -s -H "Authorization: Bearer $TOK" localhost:8000/api/v1/assets/
+```
+
+Five services: **web** (Django), **db** (PostgreSQL 16), **redis**, **worker**
+(Celery) and **beat** (Celery Beat, which A4's hourly schedule needs). `web`
+waits for `db` and `redis` to report healthy before it starts, so the `migrate`
+above never races the database coming up.
+
+Tests inside the container, against PostgreSQL rather than SQLite:
+
+```bash
+docker compose exec web pytest
+```
+
+Tear down, including the database volume:
+
+```bash
+docker compose down -v
+```
+
+**If port 8000 is taken**, prefix with `WEB_PORT=8090` — e.g.
+`WEB_PORT=8090 docker compose up -d --build` — and use that port in the curls.
+Neither PostgreSQL nor Redis is published to the host at all, so they cannot
+collide with ones you already run. To inspect the database:
+`docker compose exec db psql -U fieldassets -d fieldassets`.
+
+**I am facing issue in postgress DB in my PC beacuse I have port issue and I forgot the postgress password, so I use sqllite DB for testing**
 
 ### Locally, without Docker
 
@@ -43,8 +77,9 @@ python manage.py seed_demo_data      # data + the account you get a token for
 python manage.py runserver
 ```
 
-Celery needs a Redis to talk to; `docker compose up -d redis` is enough. Then,
-in two more terminals:
+Without `POSTGRES_HOST` set, the app falls back to SQLite, so this needs no
+services at all. Celery still needs a Redis: `docker compose up -d redis` is
+enough. Then, in two more terminals:
 
 ```bash
 celery -A server worker --loglevel=info
@@ -124,10 +159,15 @@ lock at `BEGIN` rather than at its first write. A concurrent check-out then
 Verified live: six concurrent requests for one asset returned one `201` and five
 `409`s, leaving exactly one open check-out row.
 
-Moving to PostgreSQL is a `DATABASES` change and nothing else. The service code
-is already written for it — the `FOR UPDATE` becomes real row-level locking, the
-partial index is native, and `_is_open_checkout_conflict` recognises both
-backends' wording for the violation.
+**On PostgreSQL none of that applies** — `SELECT ... FOR UPDATE` is real
+row-level locking and the partial index is native. `settings.py` picks the
+backend from `POSTGRES_HOST`: PostgreSQL under docker-compose, SQLite otherwise
+so the suite and a bare `runserver` need no services. `_is_open_checkout_conflict`
+recognises both backends' wording for the violation.
+
+Verified on PostgreSQL 16 in the compose stack: eight concurrent requests for
+one asset returned **one `201` and seven `409`s**, leaving exactly one open
+check-out row.
 
 ## A3 — the two query-constrained endpoints
 

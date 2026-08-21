@@ -4,5 +4,6 @@ djangorestframework-simplejwt==5.3.1
 django-filter==24.3
 celery==5.4.0
 redis==5.2.1
+psycopg[binary]==3.2.3
 pytest==8.3.4
 pytest-django==4.9.0

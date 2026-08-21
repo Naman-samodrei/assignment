@@ -83,32 +83,48 @@ WSGI_APPLICATION = 'server.wsgi.application'
 
 # Database
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
+#
+# PostgreSQL when POSTGRES_HOST is set (that is what docker-compose does), and
+# SQLite otherwise so the test suite and a bare `runserver` work with no
+# services running. Rule 7 is correct on both, by different means -- see the
+# comment on OPTIONS below.
 
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        # In docker-compose this points at the shared /data volume so web,
-        # worker and beat all open the same database file.
-        'NAME': os.environ.get('SQLITE_PATH', BASE_DIR / 'db.sqlite3'),
-        # A5: a file-backed test database, not the default shared-cache
-        # in-memory one. Shared-cache SQLite raises SQLITE_LOCKED, which no busy
-        # timeout retries, so the concurrency tests would fail for a reason that
-        # has nothing to do with the rule under test.
-        'TEST': {'NAME': BASE_DIR / 'test_db.sqlite3'},
-        'OPTIONS': {
-            # Rule 7 needs real write serialisation. WAL plus IMMEDIATE means a
-            # transaction takes SQLite's single write lock at BEGIN rather than
-            # at its first write, so a concurrent check-out waits for the lock
-            # (up to `timeout`) instead of failing with "database is locked"
-            # halfway through. On PostgreSQL these options are unnecessary --
-            # the SELECT ... FOR UPDATE in the service does the same job at row
-            # granularity.
-            'init_command': 'PRAGMA journal_mode=WAL;',
-            'transaction_mode': 'IMMEDIATE',
-            'timeout': 20,
-        },
+if os.environ.get('POSTGRES_HOST'):
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.postgresql',
+            'NAME': os.environ.get('POSTGRES_DB', 'fieldassets'),
+            'USER': os.environ.get('POSTGRES_USER', 'fieldassets'),
+            'PASSWORD': os.environ.get('POSTGRES_PASSWORD', 'fieldassets'),
+            'HOST': os.environ['POSTGRES_HOST'],
+            'PORT': os.environ.get('POSTGRES_PORT', '5432'),
+            # Rule 7 needs nothing special here: SELECT ... FOR UPDATE in
+            # fieldassets.services locks the asset row for real, and the partial
+            # unique index is native.
+        }
     }
-}
+else:
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': os.environ.get('SQLITE_PATH', BASE_DIR / 'db.sqlite3'),
+            # A5: a file-backed test database, not the default shared-cache
+            # in-memory one. Shared-cache SQLite raises SQLITE_LOCKED, which no
+
+            'TEST': {'NAME': BASE_DIR / 'test_db.sqlite3'},
+            'OPTIONS': {
+                # select_for_update() is a no-op on SQLite, so the equivalent
+                # work happens at the connection level: WAL plus IMMEDIATE makes
+                # a transaction take SQLite's single write lock at BEGIN rather
+                # than at its first write, so a concurrent check-out waits for
+                # the lock instead of failing with "database is locked" halfway
+                # through.
+                'init_command': 'PRAGMA journal_mode=WAL;',
+                'transaction_mode': 'IMMEDIATE',
+                'timeout': 20,
+            },
+        }
+    }
 
 
 # Password validation

@@ -1,34 +1,55 @@
-# A4: Redis broker, a Celery worker, and Celery Beat on an hourly schedule.
+# A7: the Django app, PostgreSQL, Redis and a Celery worker — plus Celery Beat,
+# which A4's hourly schedule needs.
 #
 #   docker compose up -d --build
-#   docker compose logs -f beat worker
+#   docker compose exec web python manage.py migrate
+#   docker compose exec web python manage.py seed_demo_data
 
 services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: fieldassets
+      POSTGRES_USER: fieldassets
+      POSTGRES_PASSWORD: fieldassets
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # Deliberately not published to the host, so the stack cannot collide with a
+    # Postgres you already run. To poke at it:
+    #   docker compose exec db psql -U fieldassets -d fieldassets
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fieldassets -d fieldassets"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
   redis:
     image: redis:7-alpine
     # Deliberately not published to the host: only web, worker and beat talk to
-    # it, over the compose network at redis:6379. Nothing to collide with a
-    # Redis you already run locally.
+    # it, over the compose network at redis:6379.
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
-      retries: 10
+      retries: 20
 
   web:
     build: .
-    command: sh -c "python manage.py migrate && python manage.py runserver 0.0.0.0:8000"
+    command: python manage.py runserver 0.0.0.0:8000
     environment: &env
-      SQLITE_PATH: /data/db.sqlite3
+      DJANGO_SETTINGS_MODULE: server.settings
+      POSTGRES_HOST: db
+      POSTGRES_DB: fieldassets
+      POSTGRES_USER: fieldassets
+      POSTGRES_PASSWORD: fieldassets
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/1
-      DJANGO_SETTINGS_MODULE: server.settings
-    volumes:
-      - dbdata:/data
     ports:
-      # Override with WEB_PORT=8090 docker compose up if 8000 is taken.
+      # Override with WEB_PORT=8090 docker compose up  if 8000 is taken.
       - "${WEB_PORT:-8000}:8000"
     depends_on:
+      db:
+        condition: service_healthy
       redis:
         condition: service_healthy
 
@@ -36,25 +57,21 @@ services:
     build: .
     command: celery -A server worker --loglevel=info
     environment: *env
-    volumes:
-      - dbdata:/data
     depends_on:
+      db:
+        condition: service_healthy
       redis:
         condition: service_healthy
-      web:
-        condition: service_started
 
   beat:
     build: .
     command: celery -A server beat --loglevel=info
     environment: *env
-    volumes:
-      - dbdata:/data
     depends_on:
+      db:
+        condition: service_healthy
       redis:
         condition: service_healthy
-      web:
-        condition: service_started
 
 volumes:
-  dbdata:
+  pgdata:
