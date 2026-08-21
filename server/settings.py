@@ -10,8 +10,11 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/5.2/ref/settings/
 """
 
+import os
 from datetime import timedelta
 from pathlib import Path
+
+from celery.schedules import crontab
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -84,7 +87,9 @@ WSGI_APPLICATION = 'server.wsgi.application'
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+        # In docker-compose this points at the shared /data volume so web,
+        # worker and beat all open the same database file.
+        'NAME': os.environ.get('SQLITE_PATH', BASE_DIR / 'db.sqlite3'),
         'OPTIONS': {
             # Rule 7 needs real write serialisation. WAL plus IMMEDIATE means a
             # transaction takes SQLite's single write lock at BEGIN rather than
@@ -182,3 +187,20 @@ SIMPLE_JWT = {
 
 MAX_OPEN_CHECKOUTS_PER_EMPLOYEE = 3
 MAX_DUE_AT_HORIZON_DAYS = 30
+
+
+# Celery / A4
+# https://docs.celeryq.dev/en/stable/django/
+
+CELERY_BROKER_URL = os.environ.get('CELERY_BROKER_URL', 'redis://localhost:6379/0')
+CELERY_RESULT_BACKEND = os.environ.get('CELERY_RESULT_BACKEND', 'redis://localhost:6379/1')
+CELERY_TIMEZONE = TIME_ZONE
+CELERY_TASK_TRACK_STARTED = True
+
+# A4: hourly, on the hour.
+CELERY_BEAT_SCHEDULE = {
+    'flag-overdue-checkouts-hourly': {
+        'task': 'fieldassets.tasks.flag_overdue_checkouts',
+        'schedule': crontab(minute=0),
+    },
+}

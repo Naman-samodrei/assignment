@@ -1,0 +1,60 @@
+# A4: Redis broker, a Celery worker, and Celery Beat on an hourly schedule.
+#
+#   docker compose up -d --build
+#   docker compose logs -f beat worker
+
+services:
+  redis:
+    image: redis:7-alpine
+    # Deliberately not published to the host: only web, worker and beat talk to
+    # it, over the compose network at redis:6379. Nothing to collide with a
+    # Redis you already run locally.
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  web:
+    build: .
+    command: sh -c "python manage.py migrate && python manage.py runserver 0.0.0.0:8000"
+    environment: &env
+      SQLITE_PATH: /data/db.sqlite3
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      DJANGO_SETTINGS_MODULE: server.settings
+    volumes:
+      - dbdata:/data
+    ports:
+      # Override with WEB_PORT=8090 docker compose up if 8000 is taken.
+      - "${WEB_PORT:-8000}:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: .
+    command: celery -A server worker --loglevel=info
+    environment: *env
+    volumes:
+      - dbdata:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+      web:
+        condition: service_started
+
+  beat:
+    build: .
+    command: celery -A server beat --loglevel=info
+    environment: *env
+    volumes:
+      - dbdata:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+      web:
+        condition: service_started
+
+volumes:
+  dbdata:

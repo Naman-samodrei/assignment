@@ -96,6 +96,16 @@ class OverdueNotice(models.Model):
 
     class Meta:
         ordering = ["-notice_date"]
+        constraints = [
+            # A4: this is what actually makes flag_overdue_checkouts idempotent.
+            # The task also filters out check-outs that already have today's
+            # notice, but that check can lose a race between two workers; a
+            # unique index cannot.
+            models.UniqueConstraint(
+                fields=["checkout", "notice_date"],
+                name="uniq_notice_per_checkout_per_day",
+            ),
+        ]
 
     def __str__(self) -> str:
         return f"notice {self.checkout_id} @ {self.notice_date}"

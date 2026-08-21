@@ -40,10 +40,19 @@ def employee_summary(employee_code, *, now=None):
         lifetime_checkouts=Count("checkouts"),
         currently_held=Count("checkouts", filter=open_q),
         currently_overdue=Count(
-            "checkouts", filter=open_q & Q(checkouts__due_at__lt=now)
+            "checkouts", filter=open_q & Q(checkouts__due_at__lte=now)
         ),
         mean_hold=Avg(hold_duration, filter=returned_q),
     )
+
+
+def open_and_overdue(now):
+    """The one definition of "overdue", shared by the A3 report and the A4 task.
+
+    ``due_at <= now`` rather than ``<``: a check-out due at exactly this instant
+    has reached its deadline, so it counts.
+    """
+    return Q(returned_at__isnull=True, due_at__lte=now)
 
 
 def overdue_checkouts(*, now=None):
@@ -55,7 +64,7 @@ def overdue_checkouts(*, now=None):
     """
     now = now or timezone.now()
     return (
-        CheckOut.objects.filter(returned_at__isnull=True, due_at__lt=now)
+        CheckOut.objects.filter(open_and_overdue(now))
         .select_related("asset", "employee")
         .annotate(
             overdue_by=ExpressionWrapper(
