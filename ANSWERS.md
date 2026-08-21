@@ -1330,3 +1330,80 @@ session and vacuuming would confirm it by fixing it.
 I would not guess between them. Both are one query away, and step 5 usually
 distinguishes them immediately: a `Seq Scan` points at the first, a high
 `Heap Fetches` under a retained `Index Only Scan` points at the second.
+
+## D3. CI/CD and safety
+
+### On a pull request
+
+Five jobs, in parallel, all required to merge:
+
+- **lint** — `ruff check .` and `ruff format --check .`.
+- **migrations** — `manage.py makemigrations --check --dry-run`, which fails if a
+  model change has no migration, and `django-migration-linter` on the diff, which
+  fails on backward-incompatible operations: `DROP COLUMN`, `SET NOT NULL`,
+  renames, and a `NOT NULL` column added with a default. This job is what
+  mechanically enforces the expand/contract discipline from D1 — otherwise it is
+  a convention people forget under deadline.
+- **test** — `pytest` with `services: postgres:16` and `redis:7`, not SQLite. The
+  concurrency tests depend on real `SELECT ... FOR UPDATE`; on SQLite they would
+  pass while testing nothing.
+- **security** — `pip-audit`, plus Dependabot on a schedule.
+- **build** — `docker build` to prove the image still builds; not pushed.
+
+`concurrency: cancel-in-progress` per branch, so superseded runs stop burning
+minutes.
+
+### On merge to main
+
+Everything above re-runs against the merge commit, then:
+
+- build and push the image, tagged with the **git SHA**, never `latest`;
+- deploy automatically to staging;
+- run migrations against staging, then a smoke suite — `seed_demo_data` followed
+  by the rule walk (409 on a held asset, 400 on an inactive employee, 404 on an
+  unknown tag) and a real Celery round trip through Redis. That last one matters
+  because eager-mode tests cannot catch a broken task serialiser.
+
+### What gates production
+
+A GitHub **Environment** with required reviewers, so the deploy waits on a human.
+It requires staging green, and it promotes **the image digest that was tested** —
+not a rebuild from the same tag, which would be a different artifact.
+
+### Migrations relative to the new code
+
+Migrations run **first, as a separate one-shot job that must exit zero before the
+rolling deploy begins.** Never from the container's entrypoint: four instances
+starting simultaneously means four concurrent `migrate` runs racing for the
+`django_migrations` lock, and it makes rollback ambiguous. The job runs with
+`lock_timeout` set, per D1.
+
+Migrating first is only safe because of the invariant CI enforces: **every
+migration must be compatible with the code currently running.** During the roll,
+old and new instances serve simultaneously against the new schema. Additive
+changes satisfy this; destructive ones do not, which is why they are deferred to
+a later deploy, after the code that needed them is gone.
+
+### Rollback when the schema is already migrated
+
+**You roll back the code, not the schema.** Redeploy the previous image digest —
+seconds, always available, and safe precisely because the migration was additive
+and the old code still works against the new schema. This is the payoff for the
+whole discipline: "we already migrated" becomes a non-event rather than an
+emergency.
+
+Reverse migrations are not the plan. `RunPython` reverse functions are often
+impossible to write honestly — a dropped column's data is gone — and running one
+under incident pressure is how a bad deploy becomes data loss. Where a migration
+is itself the fault, I forward-fix with a new migration rather than reversing.
+
+Two things make that credible rather than aspirational. Before any irreversible
+migration, a verified snapshot and a known PITR window, with the restore drilled
+rather than assumed. And destructive steps ship *alone*, in their own deploy,
+with nothing else to disentangle if they go wrong.
+
+The honest limitation: this protects schema changes, not data migrations. A
+backfill that writes wrong values into 4.2 million rows is not fixed by
+redeploying the old image. Those I would run as an idempotent, batched, resumable
+job with a dry-run mode that reports what it would change — and I would read that
+report before the real run.
