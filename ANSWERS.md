@@ -373,3 +373,278 @@ and a non-null `next`.
 - **`ruff`/`flake8`** would catch none of this. It is worth saying plainly: every
   defect here is semantic. Linting gives no protection against any of them,
   which is precisely why the query-count and boundary tests have to be explicit.
+
+---
+
+## Snippet 2 — check-out endpoint
+
+```python
+from rest_framework.decorators import api_view
+from rest_framework.response import Response
+
+@api_view(["POST"])
+def check_out_asset(request):
+    asset = Asset.objects.get(asset_tag=request.data["asset_tag"])
+    if asset.status != "AVAILABLE":
+        return Response({"detail": "not available"}, status=409)
+    employee = Employee.objects.get(employee_code=request.data["employee_code"])
+    open_count = CheckOut.objects.filter(
+        employee=employee, returned_at__isnull=True
+    ).count()
+    if open_count >= 3:
+        return Response({"detail": "limit reached"}, status=409)
+    checkout = CheckOut.objects.create(
+        asset=asset,
+        employee=employee,
+        due_at=request.data["due_at"],
+    )
+    asset.status = "CHECKED_OUT"
+    asset.save()
+    return Response({"id": checkout.id}, status=201)
+```
+
+### 1. What is wrong?
+
+It implements three of the eight rules. Everything below was reproduced by
+running the snippet as printed.
+
+**2.1 — No transaction. Rule 5 is violated by construction.** `CheckOut.create()`
+and `asset.save()` are two independent commits. If the second fails — a
+constraint, a lost connection, a worker killed between the two statements — the
+check-out row survives next to an `AVAILABLE` asset. That is the exact state the
+brief says must never exist, and the window is wide open on every request.
+
+**2.2 — No locking. Rule 7 fails.** Nothing serialises the status read against
+the insert. Four concurrent requests, measured:
+
+```
+thread 0: (55, 201)
+thread 1: IntegrityError: duplicate key value violates unique constraint
+thread 2: IntegrityError: duplicate key value violates unique constraint
+thread 3: IntegrityError: duplicate key value violates unique constraint
+```
+
+All four read `AVAILABLE` and all four proceeded. **The three losers got HTTP
+500, not 409.** Note *why* the data survived: Part A's partial unique index
+caught them. Against a schema without that index — which is what this snippet
+implies, since nothing in it depends on one — the same race produces four open
+check-outs for one asset and silent corruption instead of a 500. The snippet is
+wrong either way; the index only changes the failure mode from corruption to a
+crash.
+
+**2.3 — The same race applies to rule 3.** Two simultaneous requests from an
+employee holding two both read `open_count == 2`, both pass, and the employee
+ends with four. No index catches this one, so it is silent data corruption with
+no backstop at all.
+
+**2.4 — Unknown `asset_tag` or `employee_code` is a 500, not a 404. Rule 8
+fails.** `.get()` raises `DoesNotExist`, nothing catches it:
+
+```
+raises DoesNotExist  -> uncaught = HTTP 500, not 404
+```
+
+**2.5 — A missing body key is a 500, not a 400.** `request.data["asset_tag"]`
+on a body without it:
+
+```
+raises KeyError  -> uncaught = HTTP 500, not 400
+```
+
+**2.6 — Rule 2 is not implemented at all.** `is_active` is never read. An
+inactive employee checks equipment out successfully:
+
+```
+inactive employee -> (52, 201)
+```
+
+**2.7 — Rule 4 is not implemented at all.** `due_at` is neither parsed nor
+bounded. Both of these returned 201:
+
+```
+due_at 30 days in the past  -> (53, 201)
+due_at 10 years in the future -> (54, 201)
+```
+
+**2.8 — `due_at` is passed through unvalidated and untyped.** It goes to the
+model as whatever JSON contained. A naive datetime string is stored as if UTC
+with only a `RuntimeWarning`; a malformed one raises at save time — a 500 for
+what is plainly a 400.
+
+**2.9 — `asset.save()` writes every column.** No `update_fields`, so the whole
+row is overwritten from a possibly stale in-memory instance, clobbering any
+concurrent change to `name`, `category` or anything else. Only `status` changed.
+
+**2.10 — Status compared against the string literal `"AVAILABLE"`** instead of
+`AssetStatus.AVAILABLE`. A typo is not an error, just a branch that never fires.
+
+**2.11 — The response body is not what was specified.** The brief asks for 201
+with the created check-out; this returns `{"id": ...}`, so a client must issue a
+second request to learn anything about what it just created.
+
+### 2. Why does it look correct in local testing?
+
+**The transaction and locking defects (2.1–2.3) need concurrency, and manual
+testing has none.** One `curl` at a time never interleaves. `runserver` handles
+requests sequentially in practice, so even clicking fast in two tabs will not
+reproduce it. The race needs genuine parallelism — threads or multiple gunicorn
+workers — which appears for the first time in production. The atomicity window
+in 2.1 is worse: it requires not just concurrency but a *failure* at a specific
+statement, so it is invisible until something else goes wrong, and then it
+corrupts data while everyone's attention is on the original outage.
+
+**The missing rules (2.6, 2.7) hide because the endpoint returns 201.** Testing
+the happy path exercises exactly the code that exists. You only discover a rule
+is missing by testing the case it forbids — and there is no failing behaviour to
+prompt you, because a missing check never throws. This is the same shape as
+Snippet 1's missing auth: a check that isn't there fails open, silently.
+
+**The 500s (2.4, 2.5) look like bad input rather than bad code.** With
+`DEBUG=True` the developer sees a `DoesNotExist` traceback, thinks "right, that
+tag doesn't exist", and moves on — the traceback confirms their mental model
+instead of contradicting it. The status code is never examined, because a human
+reading a stack trace has already got their answer. In production the same path
+is a 500 that pages someone, and a client that cannot distinguish "you asked for
+something that isn't there" from "we're broken".
+
+**2.8 hides because hand-written test requests are well-formed.** Anyone typing
+`due_at` by hand produces ISO 8601 with an offset, which is the one input that
+works.
+
+**2.9 hides because dev has one writer.** Lost updates need a second writer.
+
+### 3. How would you fix it?
+
+```python
+from django.db import IntegrityError, transaction
+from rest_framework.exceptions import NotFound, ValidationError
+
+
+@transaction.atomic                                    # 2.1: one commit or none
+def check_out_asset(*, asset_tag, employee_code, due_at, condition_note=""):
+    validate_due_at(due_at)                            # 2.7 / 2.8
+
+    # 2.2 / 2.3: lock the rows before reading them. Always asset-then-employee,
+    # so two check-outs can never hold one and wait on the other.
+    asset = _get_locked_asset(asset_tag)               # 2.4: NotFound -> 404
+    employee = _get_locked_employee(employee_code)     # 2.4: NotFound -> 404
+
+    if not employee.is_active:                         # 2.6
+        raise ValidationError(
+            {"employee_code": ["Employee is inactive and cannot check out assets."]}
+        )
+    if asset.status != AssetStatus.AVAILABLE:          # 2.10: enum, not a literal
+        raise AssetNotAvailable(...)
+    if open_checkout_count(employee) >= max_open_checkouts():
+        raise CheckOutLimitReached(...)
+
+    try:
+        with transaction.atomic():                     # savepoint
+            checkout = CheckOut.objects.create(
+                asset=asset, employee=employee, due_at=due_at,
+                condition_note=condition_note or "",
+            )
+    except IntegrityError as exc:
+        # 2.2: the loser's constraint violation becomes a 409, not a 500.
+        if _is_open_checkout_conflict(exc):
+            raise AssetNotAvailable(...) from exc
+        raise
+
+    asset.status = AssetStatus.CHECKED_OUT
+    asset.save(update_fields=["status", "updated_at"])  # 2.9
+    return checkout
+```
+
+with the view reduced to parse / delegate / serialise, so `KeyError` (2.5)
+becomes a serializer 400 and the response carries the created object (2.11):
+
+```python
+class CheckOutCreateView(APIView):
+    def post(self, request):
+        payload = CheckOutCreateSerializer(data=request.data)
+        payload.is_valid(raise_exception=True)         # 2.5, 2.7, 2.8 -> 400
+        checkout = check_out_asset(**payload.validated_data)
+        return Response(CheckOutSerializer(checkout).data, status=201)
+```
+
+This is what ships in Part A — [`fieldassets/services.py`](fieldassets/services.py).
+Two points about it:
+
+**The rules live in the service, not the view.** The snippet's deepest problem is
+structural: business rules written inline in a view are reachable only over
+HTTP, so a management command or a shell session can bypass every one of them.
+Moving them into a function means the guarantees hold for any caller.
+
+**Rule 7 is defended twice, deliberately.** The lock produces the correct
+*status code*; the partial unique index guarantees *correctness* even if some
+future code path reaches the insert without the lock. The snippet's race
+demonstrates exactly why both are wanted — the index alone left the data correct
+but returned 500, and the lock alone would leave nothing behind it.
+
+### 4. What test or tooling would have caught this?
+
+**A threaded race test — catches 2.2 and 2.3.** The one test that matters most
+here, because no amount of sequential testing substitutes for it:
+
+```python
+@pytest.mark.django_db(transaction=True)
+def test_two_simultaneous_checkouts_of_one_asset_leave_exactly_one_winner(...):
+    results = race(lambda i: check_out_asset(...), count=2)
+    winners = [r for r, exc in results if exc is None]
+    assert len(winners) == 1
+    assert isinstance(losers[0], Conflict)          # 409, not IntegrityError
+```
+
+`transaction=True` is the load-bearing detail — the transaction a normal
+`django_db` test wraps everything in hides the racers' commits from each other,
+and the test would pass without ever having raced.
+
+**Fault injection — catches 2.1.** Atomicity has no happy path to observe, so
+the only way to test it is to break the second write on purpose:
+
+```python
+monkeypatch.setattr("fieldassets.models.Asset.save", boom)
+with pytest.raises(RuntimeError):
+    post_checkout(asset.asset_tag, employee.employee_code)
+assert not CheckOut.objects.exists()               # no orphan row
+assert asset.status == AssetStatus.AVAILABLE
+```
+
+**One negative test per rule — catches 2.4 through 2.7.** These are trivial and
+they are exactly what was missing. A checklist derived from the rules, asserting
+the *status code* rather than "it didn't crash":
+
+```python
+def test_an_inactive_employee_is_a_bad_request(...)      # 400   rule 2
+def test_a_past_due_at_is_rejected(...)                  # 400   rule 4
+def test_more_than_thirty_days_out_is_rejected(...)      # 400   rule 4
+def test_an_unknown_asset_tag_is_a_404(...)              # 404   rule 8
+def test_an_unparseable_due_at_is_a_400_not_a_crash(...)  # 400  not 500
+```
+
+**A database constraint as a backstop — turns 2.2 from corruption into a caught
+error.** `UniqueConstraint(fields=["asset"], condition=Q(returned_at__isnull=True))`
+is the reason the measured race left one row instead of four. Tests can be
+forgotten; the index cannot. Worth asserting directly, so weakening it fails the
+build:
+
+```python
+def test_the_database_rejects_a_second_open_checkout_row(...):
+    with pytest.raises(IntegrityError): ...
+```
+
+**Tooling:**
+
+- **Mutation-style checking of the guarantees.** Every test above was verified to
+  fail when its guarantee is removed — weakening the index fails 2 tests,
+  changing the limit from 3 to 4 fails 1. A test that cannot fail is worse than
+  no test, and this is cheap to confirm once.
+- **Error-rate alerting on 5xx by endpoint** (Sentry). 2.4 and 2.5 turn ordinary
+  client mistakes into server errors; in production they show up as a 500 rate
+  that tracks traffic, which is the signal that something is mapping the wrong
+  status code.
+- **Load testing with real concurrency** (locust, k6) against a staging instance
+  with more than one worker — the environment where 2.1–2.3 exist at all.
+- **Code review with the rule list open.** Six of these eleven defects are rules
+  simply absent from the code. No tool detects a requirement that was never
+  written down in the first place; a checklist does.
