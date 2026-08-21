@@ -90,6 +90,11 @@ DATABASES = {
         # In docker-compose this points at the shared /data volume so web,
         # worker and beat all open the same database file.
         'NAME': os.environ.get('SQLITE_PATH', BASE_DIR / 'db.sqlite3'),
+        # A5: a file-backed test database, not the default shared-cache
+        # in-memory one. Shared-cache SQLite raises SQLITE_LOCKED, which no busy
+        # timeout retries, so the concurrency tests would fail for a reason that
+        # has nothing to do with the rule under test.
+        'TEST': {'NAME': BASE_DIR / 'test_db.sqlite3'},
         'OPTIONS': {
             # Rule 7 needs real write serialisation. WAL plus IMMEDIATE means a
             # transaction takes SQLite's single write lock at BEGIN rather than

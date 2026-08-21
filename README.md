@@ -211,6 +211,58 @@ Verified end to end by temporarily running a throwaway `beat` container with a
 5-second schedule: Beat logged five `Sending due task` lines, the worker logged
 five completions, and the notice count stayed at 5 with zero duplicates.
 
+## A5 — tests
+
+**pytest-django**, 82 tests.
+
+```bash
+pytest
+```
+
+The brief allowed either runner; this is pytest-django, so `pytest` is the entry
+point. The tests use pytest fixtures and `parametrize`, so `manage.py test` will
+not collect them — `pytest.ini` holds the settings module and the test path.
+
+| File | Covers |
+|---|---|
+| `tests/test_concurrency.py` | rule 7: 2-way and 5-way races, the race over HTTP, and the index asserted directly |
+| `tests/test_checkout_limit.py` | the three-open-check-outs limit, plus rules 1, 2, 4, 5, 6, 8 |
+| `tests/test_overdue.py` | the overdue calculation, incl. **due exactly now**, ordering, the N+1 guard, pagination |
+| `tests/test_employee_summary.py` | the four numbers against controlled data, and that they cost one query |
+| `tests/test_tasks.py` | idempotency across 2 and 5 runs, day rollover, batching, and a 4-worker race |
+| `tests/test_auth_and_health.py` | unauthenticated health, 401 everywhere else, JWT obtain/refresh |
+| `tests/test_assets.py` | create, filter, search, pagination, `current_holder` |
+
+The suite runs on SQLite. `DATABASES['default']['TEST']` points at a **file**, not
+the default shared-cache in-memory database: shared-cache SQLite raises
+`SQLITE_LOCKED`, which no busy timeout retries, so the concurrency tests would
+fail for a reason unrelated to the rule under test.
+
+### The tests were checked for being vacuous
+
+A test that cannot fail is worse than no test, so each guarantee was mutated and
+the suite re-run:
+
+| Mutation | Result |
+|---|---|
+| overdue boundary `<=` → `<` | **4 failures** across the report, the task and the summary |
+| `MAX_OPEN_CHECKOUTS_PER_EMPLOYEE` 3 → 4 | **1 failure** — the fourth check-out stops being rejected |
+| weaken `uniq_open_checkout_per_asset` | **2 failures** — the rule 7 guarantee tests |
+| weaken `uniq_notice_per_checkout_per_day` | **1 failure** — the 4-worker race duplicates notices |
+| delete the task's `.exclude()` filter | **1 failure**, and *not* an idempotency one |
+
+That last row is the informative one. With the filter gone the idempotency tests
+still pass — only the test asserting a repeat run reports `examined: 0` fails.
+That is the split working exactly as designed: the filter is an optimisation,
+the index is the guarantee.
+
+The boundary mutation also caught a real defect while this was being written.
+`currently_overdue` in the employee summary had its **own** copy of the
+`due_at <= now` predicate, so the "single definition" claim was false and the
+summary would not have moved with the report. `queries.open_and_overdue()` now
+takes a `prefix` so the summary applies literally the same predicate across the
+relation; the mutation now fails all three consumers instead of two.
+
 ## Assumptions
 
 Judgement calls where the brief left room:
