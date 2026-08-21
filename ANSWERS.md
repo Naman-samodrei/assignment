@@ -1259,3 +1259,74 @@ request**. A migration that needs a millisecond of lock takes the site down for
 as long as that one report runs. So every DDL statement runs with
 `SET lock_timeout = '3s'`, failing fast and retrying rather than forming a
 queue — and I would check `pg_stat_activity` for long transactions first.
+
+## D2. Latency triage: `/reports/overdue/` at 25 s with no deploy in nine days
+
+No deploy means the code is a constant. Something else moved: the data, the
+plan, or the environment. I check in that order of cheapness.
+
+**1. Is it only this endpoint?** Compare p95 across routes and hit
+`/api/v1/health/`. If everything is slow, it is shared — DB host, connection
+pool, network — and the overdue report is a symptom, not the story. If only this
+route moved, it is specific to this query or its data. *Rules out/in: shared
+infrastructure.*
+
+**2. Step change or ramp?** Pull the latency graph for two weeks. "Fine for
+months, 25 s this morning" says step, and a step at a precise timestamp points to
+a discrete event — a plan flip, a failover, a long transaction starting, a batch
+job. A gradual ramp would instead point at data growth, and would have been
+visible for days. *Rules out slow accumulation.*
+
+**3. Is the time in the database?** `pg_stat_statements` for this query's
+`mean_exec_time` and `calls`. If the DB is still fast, the problem is app-side —
+worker saturation, or serialising a suddenly-huge result. If the DB owns the 25 s,
+continue. *Splits app from database.*
+
+**4. How many rows does it now match?** The page is capped at 20, but
+pagination's `COUNT(*)` runs over the whole matching set. If the overdue
+population jumped — a bulk import, a batch of due dates crossing at once, or the
+A4 sweep failing so nothing is being chased — the count is the cost.
+*Rules in a data-volume change.*
+
+**5. `EXPLAIN (ANALYZE, BUFFERS)` now**, against the known-good plan. I look for
+`Seq Scan` where there was an index scan, `Heap Fetches` climbing under an
+`Index Only Scan`, and estimated-versus-actual rows diverging.
+
+**6. Vacuum and stats.** `pg_stat_user_tables`: `last_autoanalyze`,
+`n_mod_since_analyze`, `n_dead_tup`, `last_autovacuum`.
+
+**7. Locks and long transactions.** `pg_stat_activity` for
+`state = 'idle in transaction'` ordered by `xact_start`; `pg_locks` for blockers;
+`wait_event_type` on the slow backend.
+
+**8. Resources.** Connection-pool saturation, DB CPU and IOPS, disk headroom,
+replica lag if reads are routed to a replica.
+
+### The two most likely, and how I would confirm each
+
+**A plan flip from stale statistics.** The classic shape of "nothing changed and
+it fell off a cliff". As the open-overdue set grew, the planner's estimate
+crossed a cost threshold and it abandoned the index for a sequential scan — and
+because the estimate is stale, it does not know it was wrong. **Confirm:**
+`EXPLAIN (ANALYZE, BUFFERS)` and compare the scan node to the known-good plan;
+check `last_autoanalyze` and `n_mod_since_analyze` on `checkouts`; then run
+`ANALYZE checkouts` in a transaction and re-`EXPLAIN`. If the plan snaps back,
+that is the answer, and the fix is per-table autovacuum tuning plus a raised
+`default_statistics_target` on the columns involved — not a one-off `ANALYZE`.
+
+**Autovacuum starved by a long-lived transaction.** One session left
+`idle in transaction` — a stuck worker, an abandoned psql, a job that opened a
+transaction and blocked — holds back the xmin horizon, so vacuum cannot reclaim
+dead tuples anywhere. The visibility map goes stale, the index-only scan starts
+fetching from the heap, and bloat grows the pages it has to read. This fits
+"fine for months, sudden this morning" precisely, because the damage begins the
+moment that session opens. **Confirm:**
+`SELECT pid, state, xact_start, now() - xact_start AS age, query FROM
+pg_stat_activity WHERE state LIKE 'idle in transaction%' ORDER BY xact_start;`
+then compare `n_dead_tup` and `last_autovacuum` against a healthy table, and look
+for `Heap Fetches` in the plan being large rather than zero. Terminating the
+session and vacuuming would confirm it by fixing it.
+
+I would not guess between them. Both are one query away, and step 5 usually
+distinguishes them immediately: a `Seq Scan` points at the first, a high
+`Heap Fetches` under a retained `Index Only Scan` points at the second.
