@@ -648,3 +648,264 @@ def test_the_database_rejects_a_second_open_checkout_row(...):
 - **Code review with the rule list open.** Six of these eleven defects are rules
   simply absent from the code. No tool detects a requirement that was never
   written down in the first place; a checklist does.
+
+---
+
+## Snippet 3 — overdue notice task
+
+```python
+from celery import shared_task
+from django.utils import timezone
+
+@shared_task
+def send_overdue_notices():
+    overdue = CheckOut.objects.filter(
+        returned_at__isnull=True,
+        due_at__lt=timezone.now(),
+    )
+    for c in overdue:
+        OverdueNotice.objects.create(checkout=c, notice_date=timezone.now().date())
+        deliver_email.delay(c.employee, c)
+    return "sent %d notices" % overdue.count()
+```
+
+### 1. What is wrong?
+
+**3.1 — It does not survive its own first row.** `deliver_email.delay(c.employee, c)`
+passes model instances as task arguments. Celery's default serializer is JSON,
+and a model is not JSON-serializable:
+
+```
+EncodeError: Object of type Employee is not JSON serializable
+   -> the loop body dies on the FIRST row
+notices created before it died: 1
+```
+
+This is the worst possible shape of failure: the `OverdueNotice` is created
+*before* the dispatch raises, so every attempt commits one more notice and then
+aborts. The task never reaches row two, no matter how often it retries, and each
+retry leaves another orphan behind. Arguments must be primitives — pass
+`employee_id` and `checkout_id` and re-fetch in the consumer. That also fixes a
+second problem hiding underneath: a serialized instance is a *snapshot*, so even
+with pickle enabled the email would render from data that may be stale by the
+time it is delivered.
+
+**3.2 — Not idempotent. A retry duplicates every notice it already wrote.**
+Nothing filters out check-outs that already have today's notice. With the
+dispatch stubbed so the loop can complete, and Part A's unique index dropped so
+the snippet's own schema assumptions hold:
+
+```
+run 1: 'sent 10 notices'   emails queued=10
+run 2: 'sent 10 notices'   emails queued=10     <- a retry
+notices now : 20 for 10 overdue check-outs
+duplicated  : 10 (checkout, date) pairs, each appearing 2 times
+```
+
+Five retries, five notices per check-out, and five emails to each employee. On
+the real Part A schema the second run instead dies with
+`IntegrityError: duplicate key value violates unique constraint
+"uniq_notice_per_checkout_per_day"` — the index converts silent duplication into
+a crash, but the task is wrong either way.
+
+**3.3 — The dual-write problem: emails are dispatched before the database says
+the work is durable.** `create()` then `delay()` are two separate systems with no
+coordination. If the surrounding transaction rolls back — a retry wrapper,
+`ATOMIC_REQUESTS`, a later error — the notice disappears but the email has
+already left. Conversely, wrapping the whole loop in one transaction makes it
+worse, because emails would then be queued for rows that get rolled back.
+Dispatch belongs in `transaction.on_commit`.
+
+**3.4 — Partial failure has no recovery story.** Fail at row 5,000 of 40,000 and
+5,000 notices exist, 5,000 emails are queued, 35,000 rows are untouched, and the
+only available action is a full re-run — which, per 3.2, re-notifies the first
+5,000. The task has no way to resume, because it has no notion of what it
+already did.
+
+**3.5 — The entire result set is loaded into memory.** `for c in overdue`
+evaluates and caches every row. At tens of thousands of check-outs that is tens
+of thousands of model instances resident at once, in a worker process sized for
+ordinary jobs. The failure mode is the worker being OOM-killed mid-loop —
+which lands straight back on 3.4, having written an unknown number of notices.
+
+**3.6 — One INSERT per row, plus an N+1 on `employee`.** Measured at 21 queries
+for 10 rows: one SELECT, then per row one INSERT and one SELECT for
+`c.employee` (no `select_related`). At 40,000 rows that is 80,001 round trips.
+
+**3.7 — `timezone.now()` is re-read on every iteration.** For a run long enough
+to matter — which is exactly the tens-of-thousands case — the date can roll over
+mid-loop, so one execution produces notices dated across two different days.
+That also breaks the dedup key in 3.2 at precisely the moment it is needed most.
+
+**3.8 — `timezone.now().date()` is the UTC date, not the local one.** It should be
+`timezone.localdate()`. Under any non-UTC `TIME_ZONE` the notice is dated wrong
+for part of every day, and "one notice per check-out per day" starts straddling
+day boundaries.
+
+**3.9 — `due_at__lt` excludes an item due at exactly this instant.** Same
+boundary defect as Snippet 1, and it must agree with whatever the overdue report
+uses or the two views of "overdue" disagree.
+
+**3.10 — The return value is a string, and it is inaccurate.** `"sent %d
+notices"` is not machine-readable, and nothing was *sent* — emails were queued.
+It also cannot distinguish a real run from a no-op re-run, which is the single
+most useful thing an idempotent task can report. (`overdue.count()` itself is
+harmless: the loop has already populated the queryset's result cache, so it
+reuses it rather than re-querying — confirmed by measurement.)
+
+**3.11 — No task name, no retry policy, no acknowledgement strategy.** A bare
+`@shared_task` gets an auto-generated name that moves if the module is renamed.
+There is no `autoretry_for`/`max_retries`, so the failure in 3.1 is terminal and
+silent. And with `acks_late=True` a worker killed mid-loop causes redelivery —
+which, without 3.2 fixed, duplicates everything.
+
+### 2. Why does it look correct in local testing?
+
+**3.1 never fires when there are no overdue rows — and dev databases usually
+have none.** This is the key point about the whole snippet: the loop body is the
+part that is broken, and an empty queryset skips it entirely. The task returns
+`"sent 0 notices"`, exits zero, and looks perfectly healthy. It is not that the
+bug is subtle; it is that the code never ran. A fixture with one overdue
+check-out would have failed instantly — the defect is hidden by the *absence*
+of data rather than by any property of the code.
+
+**3.2 hides because nobody runs a task twice.** Manual testing is one invocation.
+Idempotency is only observable on the second run, and there is no reason to do a
+second run unless you are specifically testing for it. Retries in production are
+automatic and invisible — a broker redelivery after a worker restart looks like
+nothing at all from the outside.
+
+**3.3 hides because dev runs `CELERY_TASK_ALWAYS_EAGER` or a single worker with
+an empty queue,** so the ordering between the commit and the dispatch is never
+stressed. Rollbacks are rare in a happy-path test.
+
+**3.5, 3.6 and 3.7 hide behind the row count.** Ten rows fit in memory, 21
+queries are instant, and a loop that finishes in 30 ms cannot cross midnight.
+Every one of these defects is proportional to a scale dev does not have — which
+is why the brief's "tens of thousands of rows" is the whole hint.
+
+**3.8 hides because dev and CI both run `TIME_ZONE = "UTC"`,** where
+`now().date()` and `localdate()` are identical. It appears only after
+deployment to a project configured for a real timezone.
+
+**3.4 hides because nothing fails in dev.** Partial failure requires a failure.
+
+### 3. How would you fix it?
+
+```python
+BATCH_SIZE = 500
+
+@shared_task(name="fieldassets.tasks.flag_overdue_checkouts")
+def flag_overdue_checkouts(now=None, batch_size=BATCH_SIZE):
+    now = timezone.now() if now is None else now      # 3.7: read the clock once
+    notice_date = timezone.localdate(now)             # 3.8: local, not UTC
+
+    pending = (
+        CheckOut.objects.filter(open_and_overdue(now))       # 3.9: <= , shared
+        .exclude(notices__notice_date=notice_date)           # 3.2: skip done work
+        .order_by("pk")
+        .values_list("pk", flat=True)                        # 3.5: ids, not models
+    )
+
+    before = OverdueNotice.objects.filter(notice_date=notice_date).count()
+    examined, batch = 0, []
+
+    for checkout_id in pending.iterator(chunk_size=batch_size):   # 3.5: streams
+        examined += 1
+        batch.append(OverdueNotice(checkout_id=checkout_id, notice_date=notice_date))
+        if len(batch) >= batch_size:
+            OverdueNotice.objects.bulk_create(batch, ignore_conflicts=True)  # 3.6, 3.2
+            batch = []
+    if batch:
+        OverdueNotice.objects.bulk_create(batch, ignore_conflicts=True)
+
+    after = OverdueNotice.objects.filter(notice_date=notice_date).count()
+    return {                                          # 3.10: structured, honest
+        "notice_date": notice_date.isoformat(),
+        "examined": examined,
+        "created": after - before,
+    }
+```
+
+with `UNIQUE(checkout, notice_date)` on the model, and email dispatch by id,
+after commit:
+
+```python
+class Meta:
+    constraints = [
+        UniqueConstraint(fields=["checkout", "notice_date"],
+                         name="uniq_notice_per_checkout_per_day"),
+    ]
+
+# 3.1 + 3.3: primitives only, and only once the rows are durable.
+transaction.on_commit(lambda: deliver_email.delay(checkout_id=cid, employee_id=eid))
+```
+
+This is what ships in Part A — [`fieldassets/tasks.py`](fieldassets/tasks.py) —
+with the email dispatch deliberately left out, since A4 asks only for the
+notices.
+
+**Idempotency is defended twice, and the layers do different jobs.** The
+`.exclude()` makes a repeat run cost nothing, which keeps the hourly schedule
+cheap. The unique index is what makes it *true*, because the `.exclude()` can
+lose a race between two workers. Measured on Part A: four workers racing one
+sweep all passed the filter and each attempted every insert, and the database
+still ended with exactly one notice per check-out and zero duplicates — the
+index absorbed 87 duplicate inserts. Deleting the `.exclude()` from the shipped
+task fails only the test asserting a repeat run reports `examined: 0`; every
+idempotency test still passes. That is the split working as intended.
+
+### 4. What test or tooling would have caught this?
+
+**Run it twice and assert one notice — catches 3.2.** The single highest-value
+test, and the one the brief itself names:
+
+```python
+def test_running_it_twice_creates_one_notice(...):
+    flag_overdue_checkouts()
+    flag_overdue_checkouts()
+    assert OverdueNotice.objects.filter(checkout=checkout).count() == 1
+```
+
+**Any test with a non-empty overdue fixture — catches 3.1.** This is the
+uncomfortable one: the defect is fatal and obvious, and it survived only because
+no test ever put a row in front of it. A single fixture would have caught it. It
+argues for a rule that a task test must assert on *work done*, never merely that
+the task returned.
+
+**A concurrency test — catches the gap the `.exclude()` cannot close.**
+
+```python
+@pytest.mark.django_db(transaction=True)
+def test_four_workers_racing_one_sweep_still_leave_one_notice_each(...):
+    # all four pass the filter; the index is what saves it
+    assert OverdueNotice.objects.count() == 5
+    assert duplicate_notice_count() == 0
+```
+
+**A batching test with more rows than one batch — catches 3.5 and 3.6.**
+`flag_overdue_checkouts(batch_size=10)` against 25 overdue rows, asserting 25
+created and none duplicated, proves streaming and batching neither drop nor
+double-count.
+
+**A day-rollover test — catches 3.7 and 3.8.** Seed yesterday's notice, assert
+today's is still created. Pinning `now` as a parameter is what makes this
+testable at all — the original reads the clock itself and cannot be tested for
+it, the same untestability smell as Snippet 1.
+
+**Tooling:**
+
+- **`CELERY_TASK_ALWAYS_EAGER = False` in at least one CI job**, with a real
+  broker. Eager mode serializes nothing, so it hides 3.1 completely — the
+  defect only exists on the wire.
+- **A JSON-serializer assertion in CI**, or simply keeping
+  `task_serializer = "json"` explicit and never enabling pickle, so passing a
+  model raises loudly rather than being silently accepted.
+- **A staging dataset with production-like volume.** 3.5, 3.6 and 3.7 have no
+  symptom below a few thousand rows; no unit test substitutes for the row count.
+- **Worker memory and task-duration metrics with alerting** — an OOM-killed
+  worker mid-loop is the production shape of 3.4, and it is invisible unless
+  someone is watching RSS.
+- **Chaos-style retry testing**: kill the worker mid-task and re-run. This is the
+  only check that exercises 3.2, 3.3 and 3.4 together, and it is exactly the
+  scenario the brief describes as "retried after a partial failure".
