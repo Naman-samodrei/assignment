@@ -59,8 +59,7 @@ Tear down, including the database volume:
 docker compose down -v
 ```
 
-**If port 8000 is taken**, prefix with `WEB_PORT=8090` — e.g.
-`WEB_PORT=8090 docker compose up -d --build` — and use that port in the curls.
+`WEB_PORT=8000 docker compose up -d --build` — and use that port in the curls.
 Neither PostgreSQL nor Redis is published to the host at all, so they cannot
 collide with ones you already run. To inspect the database:
 `docker compose exec db psql -U fieldassets -d fieldassets`.

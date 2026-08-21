@@ -45,7 +45,7 @@ services:
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/1
     ports:
-      # Override with WEB_PORT=8090 docker compose up  if 8000 is taken.
+  
       - "${WEB_PORT:-8000}:8000"
     depends_on:
       db:
