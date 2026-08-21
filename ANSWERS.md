@@ -909,3 +909,273 @@ it, the same untestability smell as Snippet 1.
 - **Chaos-style retry testing**: kill the worker mid-task and re-run. This is the
   only check that exercises 3.2, 3.3 and 3.4 together, and it is exactly the
   scenario the brief describes as "retried after a partial failure".
+
+---
+
+# Part C — Optimising the slow reporting query
+
+Rather than reason about this abstractly, I built the schema at the stated scale
+and measured: 4.2M `checkouts`, 12,000 `employees` (10,764 active), 50,000
+`assets`, and **only** the indexes the brief says exist — the primary keys plus
+Django's `asset_id` and `employee_id` FK indexes.
+
+Data shape, chosen to match the brief's 8,000 rows/day:
+
+| | |
+|---|---|
+| `checkouts` | 4,200,000 rows, 437 MB heap, 584 MB with indexes |
+| open (`returned_at IS NULL`) | 173,484 — **4.13%** |
+| rows in the Jan–Jun 2026 window | 1,448,000 |
+| rows the query actually returns | **19,455** |
+
+Two caveats on the numbers below. The container runs PostgreSQL **16.15**, not
+15 — the planner behaviour discussed here is the same in both. And absolute
+times are much faster than the production 8 s, because this is a warm local SSD
+with a 128 MB `shared_buffers`. **The ratios and the plan shapes are the
+transferable part**; where I quote a time, the number that matters is the one
+next to it.
+
+## 1. Rewrite the query
+
+```sql
+SELECT c.id, c.asset_id, c.employee_id, c.checked_out_at, c.due_at
+FROM checkouts c
+JOIN employees e ON e.id = c.employee_id AND e.is_active
+WHERE c.checked_out_at >= timestamptz '2026-01-01 00:00:00+00'
+  AND c.checked_out_at <  timestamptz '2026-07-01 00:00:00+00'
+  AND c.returned_at IS NULL
+ORDER BY c.due_at ASC
+LIMIT 100;                      -- plus a keyset/offset cursor for later pages
+```
+
+Verified equivalent: both forms return **19,455** rows.
+
+**`DATE(c.checked_out_at) BETWEEN …` → a half-open range on the bare column.**
+This is the change that matters. Wrapping the column in `DATE()` makes the
+predicate non-sargable — no index on `checked_out_at` can ever be used, because
+the planner cannot invert the function. It also destroys the planner's
+statistics: it estimated **860 rows and got 21,677**, a 25× miss, which is why
+it chose a Nested Loop and then executed 21,677 separate index lookups into
+`employees`. Two further problems disappear with it: `DATE()` on a `timestamptz`
+is `STABLE`, not `IMMUTABLE`, because it depends on the session's `TimeZone` —
+so the same query returns different rows for different sessions, and the
+expression cannot be indexed without pinning a timezone. The half-open form
+`>= start AND < end` also avoids the classic `BETWEEN` bug on timestamps, where
+`<= '2026-06-30'` silently drops everything after midnight on the last day.
+**Cost:** the boundaries must now be written as explicit timestamps in a stated
+timezone. That is a real burden on the caller, and it is the right place for it —
+the alternative pushes an ambiguity into every row of a 4.2M-row scan.
+
+**`employee_id IN (SELECT …)` → an explicit join.** Semantically this one is
+nearly free: Postgres already flattens `IN (subquery)` to a semi-join. The gain
+is not the rewrite itself but what it enables once the estimates are fixed — the
+plan moves from a Nested Loop with 21,677 lookups to a single Hash Join over
+10,764 employees. **Cost:** a join can duplicate rows if the join key is not
+unique. Here `employees.id` is the primary key, so it cannot; if that were ever
+untrue, `EXISTS` would be the safer form and I would use it.
+
+**`SELECT *` → an explicit column list.** `condition_note` is `text` and may be
+TOASTed; pulling it for 19,455 rows inflates the sort, the transfer and the
+memory, and — decisively — makes an index-only scan impossible, since no
+sensible index will ever cover a wide text column. **Cost:** the caller must
+name what it needs, and the query has to be revisited when the screen adds a
+column. That is a good trade for making covering indexes viable at all.
+
+**Adding `LIMIT`.** A reporting screen rendering 19,455 rows is itself a defect;
+the number grows without bound as the table does. **Cost:** real pagination
+requires a stable cursor. `OFFSET` degrades on deep pages, so for a large report
+I would use keyset pagination on `(due_at, id)` — `id` as a tiebreaker, because
+`due_at` is not unique and without it rows can be skipped or repeated across
+pages.
+
+## 2. Indexes
+
+```sql
+CREATE INDEX CONCURRENTLY idx_checkouts_open_checked_out
+    ON checkouts (checked_out_at)
+    INCLUDE (id, due_at, employee_id, asset_id)
+    WHERE returned_at IS NULL;
+```
+
+One index. It earns its place three separate ways.
+
+**Partial, on `WHERE returned_at IS NULL` — this is the single highest-leverage
+decision.** Only 4.13% of rows are open, so the index covers 173,484 rows
+instead of 4.2M. Measured, same index definition with and without the predicate:
+
+| | size |
+|---|---|
+| partial | **9,976 kB** |
+| identical index, not partial | **235 MB** |
+
+**24× smaller.** It fits in `shared_buffers` and stays there; the full one
+competes with the heap for cache. It is also cheaper to maintain: a row enters
+the index on insert and leaves it when returned, so the index tracks the working
+set rather than history. The predicate matches how the application actually
+queries — every "open check-outs" question in Part A filters on exactly this —
+so one index serves the report, the overdue view and the rule-3 count.
+
+**`checked_out_at` as the key column, not `due_at`.** This is where I expected to
+be wrong, and measuring changed my answer. `due_at` is tempting because it would
+supply the `ORDER BY` for free and let `LIMIT` stop early. I built it and it was
+**worse**: 89 ms versus 36 ms, because scanning open rows in `due_at` order and
+filtering by date window discards most of what it reads —
+`Rows Removed by Filter: 35055` to produce 100 rows. `due_at` order and the
+`checked_out_at` window are only loosely correlated, so the "free ordering" is
+paid for many times over in wasted index entries. Ranging on `checked_out_at`
+and sorting 21,677 candidates with a `top-N heapsort` is far cheaper. **This is
+the composite-versus-partial question the brief asks about, and the honest answer
+is that the appealing composite is a trap here.**
+
+**`INCLUDE` rather than more key columns.** The extra columns ride in the leaf
+pages as payload: they enable an index-only scan without widening the B-tree's
+internal pages or affecting sort order. Putting them in the key instead would
+bloat every level of the tree for no benefit, since none of them is used for
+ranging.
+
+**What I would *not* add.** A second index on `(due_at) WHERE returned_at IS
+NULL` — measured worse for this query, as above, and it would still cost writes
+on every insert and return. An index on `employees(is_active)` — 10,764 of
+12,000 rows are active, so it is not selective enough to beat the sequential
+scan the planner already chose. And Django's existing `checkouts(employee_id)`
+index is now unused by this query; I would check `pg_stat_user_indexes` before
+touching it, since other queries may need it.
+
+`CONCURRENTLY` because building a normal index takes an `ACCESS EXCLUSIVE` lock,
+which on a 4.2M-row production table means an outage. It is slower and can leave
+an `INVALID` index if it fails, which then needs dropping and retrying — an
+acceptable price for not blocking writes.
+
+## 3. What `EXPLAIN (ANALYZE, BUFFERS)` shows
+
+**Before** — the actual plan, serial:
+
+```
+ Sort  (cost=140766..140768 rows=771) (actual rows=19455)
+   Sort Key: c.due_at
+   Sort Method: quicksort  Memory: 2592kB
+   Buffers: shared hit=80683 read=40226
+   ->  Nested Loop  (cost=0.29..140764 rows=771) (actual rows=19455)
+         ->  Seq Scan on checkouts c  (actual time=243.829..366.010 rows=21677)
+               Filter: ((returned_at IS NULL) AND (date(checked_out_at) >= ...))
+               Rows Removed by Filter: 4178323
+               Buffers: shared hit=15649 read=40226
+         ->  Index Scan using employees_pkey on employees  (loops=21677)
+ Execution Time: 441.305 ms
+```
+
+**After** — same query rewritten, one index:
+
+```
+ Sort  (actual time=... rows=19455)
+   Sort Method: quicksort  Memory: 1984kB
+   ->  Hash Join  (actual rows=19455)
+         ->  Index Only Scan using idx_checkouts_open_checked_out on checkouts c
+               (actual time=0.044..2.544 rows=21677)
+               Heap Fetches: 0
+         ->  Seq Scan on employees e  (actual rows=10764)
+ Execution Time: 17.014 ms
+```
+
+Full progression:
+
+| | scan | Rows Removed by Filter | buffers | time |
+|---|---|---|---|---|
+| baseline | `Seq Scan` | **4,178,323** | 120,909 | 441 ms |
+| rewrite + partial index | `Bitmap Index Scan` | 0 | 13,191 | 88 ms |
+| + `INCLUDE` covering | `Index Only Scan` | 0 | ~1,000 | **17 ms** |
+| + `LIMIT 100` | `Index Only Scan` | 0 | **283** | **11.7 ms** |
+
+**The specific line that tells you it worked is `Heap Fetches: 0` under
+`Index Only Scan`.** Everything else can mislead. Execution time moves for
+unrelated reasons — cache warmth, concurrent load, whether parallel workers were
+available. `Rows Removed by Filter` disappearing proves the predicate reached the
+index, but the query could still be doing 13,000 random heap reads, as the
+middle row above shows. `Heap Fetches: 0` is the unambiguous statement that the
+index alone answered the query and the heap was never touched — it is both the
+strongest result and the most fragile, because it depends on the visibility map
+being current. If `Heap Fetches` is large despite an `Index Only Scan`, the fix
+is not the index; it is autovacuum.
+
+The second line I would check is `Buffers: shared read=` — 40,226 down to 283 is
+a **142× reduction in blocks fetched**, and on a production system where the 8 s
+is I/O-bound rather than CPU-bound, that ratio is what actually converts into
+wall-clock improvement. It is also the number least distorted by my hardware
+being faster than production's.
+
+## 4. At 8,000 rows/day, what breaks first?
+
+The reassuring part first: **the index does not degrade with table growth,
+because it is partial.** The open set is a working set, not an accumulation —
+rows leave it on return. It grows only by the never-returned residue, roughly
+120 rows/day at a 1.5% abandonment rate, or about 2.5 MB/year. The heap grows
+~160 MB/year; the index barely moves. That is the durability argument for the
+partial predicate, over and above its size today.
+
+**What breaks first is the unbounded result set, not the scan.** 19,455 rows for
+a six-month window today, growing with both the window and the never-returned
+count. Serialising and shipping that to a browser is already the dominant cost
+once the scan is fixed, and no index helps. **This is why `LIMIT` is in the
+rewrite rather than being an optional extra** — it is the only part of the fix
+that keeps working at 40M rows. I would ship keyset pagination on `(due_at, id)`
+now, while the change is cheap, rather than after the screen times out again.
+
+**Second is autovacuum falling behind on index churn.** The partial index sees
+~8,000 insertions and ~8,000 deletions a day as items are checked out and
+returned. Setting `returned_at` also changes index membership, so those updates
+cannot be HOT. Left at defaults — autovacuum triggers at 20% of the table — a
+4.2M-row table needs 840,000 dead tuples before it runs, which is months of
+churn. Meanwhile the index bloats and, worse, the visibility map goes stale and
+`Heap Fetches: 0` quietly becomes `Heap Fetches: 21677`, taking the index-only
+scan with it. I would set per-table
+`autovacuum_vacuum_scale_factor = 0.01` and `autovacuum_analyze_scale_factor =
+0.005` on `checkouts` before that happens, and alert on
+`pg_stat_user_tables.n_dead_tup`.
+
+**Third, and further out, is anything that still scans the whole heap.** At
+~40M rows in five years the table is ~4 GB and any unindexed report is
+unusable. The answer then is range partitioning on `checked_out_at`, monthly,
+so old partitions can be detached and archived — the reporting screen only ever
+looks at recent windows. I would not do it now: partitioning imposes real costs
+(the partition key must be in every unique constraint, cross-partition queries
+get more expensive, and DDL becomes fiddly), and at 4.2M rows a good partial
+index makes it unnecessary. It is the fix for a problem that does not exist yet.
+
+## 5. The one thing I would measure first
+
+**The true selectivity of `returned_at IS NULL` on production data — and
+specifically within the reporting window, not table-wide.**
+
+Everything above rests on it. I modelled 4.13% open, and every conclusion is
+contingent on that number being roughly right: the partial index is 24× smaller
+*because* the open set is small, the index-only scan wins *because* 21,677
+candidates fit comfortably in memory, and the `top-N heapsort` beats the
+`due_at` index *because* there are few enough rows to sort.
+
+Change that one figure and the answer changes. If this fleet holds equipment for
+months rather than weeks — a plausible reading of "field assets" — 40% of rows
+could be open. The partial index then covers 1.7M rows, is close to 100 MB,
+stops being cache-resident, and the bitmap heap scan may well lose to the
+sequential scan it replaced. I would want a different key column, or a
+composite including `employee_id`, or partitioning sooner.
+
+I cannot know this from the schema, because it is a property of how the business
+actually operates, and it is exactly the kind of assumption that is invisible
+until it is wrong. One query answers it:
+
+```sql
+SELECT count(*) FILTER (WHERE returned_at IS NULL) AS open_rows,
+       count(*)                                    AS window_rows,
+       round(100.0 * count(*) FILTER (WHERE returned_at IS NULL) / count(*), 2) AS pct_open
+FROM checkouts
+WHERE checked_out_at >= '2026-01-01' AND checked_out_at < '2026-07-01';
+```
+
+Alongside it I would pull `pg_stat_statements` for the real query — comparing
+`shared_blks_read` against `shared_blks_hit` — because it settles a question the
+plan alone cannot: whether the production 8 s is I/O waiting on a cold cache or
+CPU burning through the filter. Both are consistent with a sequential scan, and
+they have different ceilings. If it is I/O, the 142× reduction in blocks read is
+the number that predicts the improvement. If it is CPU, the win comes from the
+4.18M discarded rows disappearing, and I should expect less than the block ratio
+suggests. I would rather know which before promising anyone a number.
